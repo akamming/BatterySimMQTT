@@ -48,6 +48,10 @@ BATTERY_SOC = 2
 BATTERY_ENERGY = 3
 COST_FIXED = 5
 COST_DYNAMIC = 6
+COST_FIXED_SIMULATED = 7
+COST_DYNAMIC_SIMULATED = 8
+BATTERY_SAVINGS_FIXED = 9
+BATTERY_SAVINGS_DYNAMIC = 10
 
 def log(msg):
     Domoticz.Log(msg)
@@ -67,8 +71,8 @@ def TimeElapsedSinceLastUpdate(last_update):
         return datetime.now() - datetime.now()  # 0 seconden
 
 def UpdateElectricCounterSensor(idx, name, power, kwh):
-    debug(f"Updating ElectricCounterSensor: idx={idx}, name={name}, power={power}, kwh={kwh}")
-    value = f"{power:.6f};{kwh:.6f}"
+    value = f"{int(power)};{float(kwh)}"
+    debug(f"Updating ElectricCounterSensor: idx={idx}, name={name}, power={power}, kwh={kwh}, value={value}")
     if idx not in Devices:
         Domoticz.Device(Name=name, Unit=idx, Type=243, Subtype=29, Used=1).Create()
     try:
@@ -83,14 +87,13 @@ def UpdateElectricCounterSensor(idx, name, power, kwh):
         Domoticz.Error(f"Unable to update ElectricCounterSensor ({name}), is 'accept new devices' aan?")
 
 def UpdateBatterySocSensor(idx, name, value):
-    # Type=25, Subtype=0 (Percentage)
     if idx not in Devices:
-        Domoticz.Device(Name=name, Unit=idx, Type=25, Subtype=0, Used=1).Create()
+        Domoticz.Device(Name=name, Unit=idx, Type=243, Subtype=6, Used=1).Create()
     try:
         device = Devices[idx]
         if (device.sValue != str(value) or 
             TimeElapsedSinceLastUpdate(device.LastUpdate).total_seconds() > MAXUPDATEINTERVAL):
-            device.Update(nValue=0, sValue=str(value))
+            device.Update(nValue=int(float(value)), sValue=str(value))
             Domoticz.Log(f"BatterySocSensor ({device.Name}) updated: {value}")
         else:
             debug(f"Not updating BatterySocSensor ({device.Name})")
@@ -98,7 +101,6 @@ def UpdateBatterySocSensor(idx, name, value):
         Domoticz.Error(f"Unable to update BatterySocSensor ({name}), is 'accept new devices' aan?")
 
 def UpdateCostSensor(idx, name, value):
-    # Type=113, Subtype=0, Switchtype=3 (General kWh)
     if idx not in Devices:
         Domoticz.Device(Name=name, Unit=idx, Type=113, Subtype=0, Switchtype=3, Used=1).Create()
     try:
@@ -130,6 +132,24 @@ def GetEnergyDeviceValues(idx):
         Domoticz.Error(f"Invalid sValue format for device {device.Name}: {device.sValue}")
         return 0, 0
 
+def GetCostDeviceValue(idx):
+    """
+    Get the current cost value from a cost sensor.
+    Returns the cost value.
+    """
+    if idx not in Devices:
+        Domoticz.Error(f"Device with Unit {idx} not found")
+        return 0
+
+    device = Devices[idx]
+    try:
+        cost = float(device.sValue)/100
+        debug(f"Retrieved cost from device {device.Name}: cost={cost} cents")
+        return cost
+    except ValueError:
+        Domoticz.Error(f"Invalid sValue format for device {device.Name}: {device.sValue}")
+        return 0
+
 class BasePlugin:
     def __init__(self):
         self.mqtt_client = None
@@ -148,7 +168,7 @@ class BasePlugin:
         self.devices_def = {}
 
     def dev_remove_all_devices(self):
-        log("Verwijderen van alle apparaten...")
+        log(f"Verwijderen van alle apparaten {list(Devices.keys())}")
         for unit in list(Devices.keys()):
             try:
                 name = Devices[unit].Name
@@ -268,7 +288,21 @@ class BasePlugin:
                 return
 
             # Get current device values
-            current_simulated_p1_power, current_simulated_p1_energy = GetEnergyDeviceValues(SIMULATED_P1_METER)
+            if SIMULATED_P1_METER in Devices:
+                current_simulated_p1_power, current_simulated_p1_energy = GetEnergyDeviceValues(SIMULATED_P1_METER) # Simulated P1 meter in Wh
+            else:
+                current_simulated_p1_energy = 0
+                current_simulated_p1_power = 0
+
+            # Initialize battery state of charge (SoC) if not already set
+            if BATTERY_ENERGY not in Devices:
+                current_battery_power = 0
+                current_battery_energy = self.config["capacity"] / 2  # Start with 50% SoC if not initialized
+            else:
+                current_battery_power, current_battery_energy = GetEnergyDeviceValues(BATTERY_ENERGY) # Battery SoC in Wh
+
+            debug(f"Simulated P1 Meter: power={current_simulated_p1_power}, energy={current_simulated_p1_energy}")
+            debug(f"Battery: power={current_battery_power}, energy={current_battery_energy}") 
 
             total_usage_wh = current_p1["use_high"] + current_p1["use_low"]
             total_return_wh = current_p1["ret_high"] + current_p1["ret_low"]
@@ -284,11 +318,11 @@ class BasePlugin:
             self.last_totals = current_p1
             debug(f"Delta usage Wh={delta_usage}, Delta return Wh={delta_return}")
 
-            net_power = (delta_usage - delta_return) / delta_t
+            net_power = (delta_usage - delta_return) / delta_t * 3600.0  # Convert Wh to W
             debug(f"Net power (W) = {net_power:.6f}")
 
-            max_charge = self.config["charge_rate"] * (delta_t / 3600.0)
-            max_discharge = self.config["discharge_rate"] * (delta_t / 3600.0)
+            max_charge = self.config["charge_rate"] * (delta_t / 3600.0) # Convert kW to Wh 
+            max_discharge = self.config["discharge_rate"] * (delta_t / 3600.0) # Convert kW to Wh
 
             debug(f"Max charge (Wh) = {max_charge:.6f}, Max discharge (Wh) = {max_discharge:.6f}")
 
@@ -296,41 +330,66 @@ class BasePlugin:
             discharge = 0.0
             net_charge = 0.0
             net_discharge = 0.0
+            new_battery_energy = current_battery_energy
+            new_battery_power = current_battery_power
 
-            if net_power > 0:
-                charge = min(net_power, max_charge, self.config["capacity"] - self.soc)
-                net_charge *= (1 - self.config["loss"])
-                self.soc += charge
+            if delta_return > 0:
+                charge = min(delta_return, max_charge, self.config["capacity"] - current_battery_energy)
+                net_charge = charge * (1 - self.config["loss"]/2)
+                new_battery_energy += net_charge
+                new_battery_power = charge / delta_t * 3600.0 # Convert Wh to W
+
+            if delta_usage > 0:
+                discharge = min(delta_usage, max_discharge, current_battery_energy)
+                net_discharge = discharge * (1 - self.config["loss"]/2)
+                new_battery_energy -= net_discharge
+                new_battery_power = -net_discharge / delta_t * 3600.0 # Convert Wh to W
+
+
+            debug(f"self.config['loss'] = {self.config['loss']:.6f}")
+            debug(f"Charge (Wh) = {charge:.6f}, Discharge (Wh) = {discharge:.6f}")
+            debug(f"Net Charge (Wh) = {net_charge:.6f}, Net Discharge (Wh) = {net_discharge:.6f}")
+            debug(f"New Battery Energy (Wh) = {new_battery_energy:.6f}, New Battery Power (W) = {new_battery_power:.6f}")
+
+            new_simulated_p1_energy = current_simulated_p1_energy + (charge - net_discharge) # Convert Wh to W
+            new_simulated_p1_power = (new_simulated_p1_energy - current_simulated_p1_energy) / delta_t * 3600.0 # Convert Wh to W
+            simulated_p1_delta = new_simulated_p1_energy - current_simulated_p1_energy
+
+            # haal huidige kosten op
+            current_cost_fixed = GetCostDeviceValue(COST_FIXED)
+            current_cost_dynamic = GetCostDeviceValue(COST_DYNAMIC)
+            current_cost_fixed_simulated = GetCostDeviceValue(COST_FIXED_SIMULATED)
+            current_cost_dynamic_simulated = GetCostDeviceValue(COST_DYNAMIC_SIMULATED)
+
+            # Bereken de delta kosten
+            delta_cost_fixed = (delta_usage * self.config["usage_tariff"]) - (delta_return * self.config["feedin_tariff"])
+            delta_cost_dynamic = (delta_usage - delta_return) * self.current_dynamic_tariff  
+
+            if simulated_p1_delta > 0:
+                # We hebben energie verbruik gesimuleerd aan de gesimuleerde P1 meter
+                delta_cost_fixed_simulated = simulated_p1_delta * self.config["usage_tariff"]
+                delta_cost_dynamic_simulated = simulated_p1_delta * self.current_dynamic_tariff
             else:
-                discharge = min(-net_power, max_discharge, self.soc)
-                net_discharge /= (1 - self.config["loss"])
-                self.soc -= discharge
+                # We hebben energie teruglevering gesimuleerd aan de gesimuleerde P1 meter
+                delta_cost_fixed_simulated = -simulated_p1_delta * self.config["feedin_tariff"]
+                delta_cost_dynamic_simulated = -simulated_p1_delta * self.current_dynamic_tariff
 
-            battery_power = charge - discharge
-            debug(f"Charge/Discharge (W) = {charge - discharge:.6f} W")
-            debug(f"Net Charge/Discharge (Wh) = {charge - discharge:.6f}, SoC = {self.soc:.6f} W")
-
-            self.soc = max(0.0, min(self.soc, self.config["capacity"]))
-            new_simulated_p1_energy = current_simulated_p1_energy + (charge - discharge)
-            current_simulated_p1_power = (new_simulated_p1_energy - current_simulated_p1_energy) / delta_t * 3600.0
-            current_simulated_p1_energy = new_simulated_p1_energy
-
-            # Kostenberekening (alle op basis van delta’s)
-            cost_fixed = delta_usage * self.config["usage_tariff"] - delta_return * self.config["feedin_tariff"]
-            cost_dynamic = (delta_usage - delta_return) * self.current_dynamic_tariff
-
-            self.cost_fixed_real += cost_fixed
-            self.cost_dynamic_real += cost_dynamic
-
-            # Debug: Kosten
-            debug(f"Fixed Cost Calculation: ({delta_usage} * {self.config['usage_tariff']} - {delta_return} * {self.config['feedin_tariff']}) = {cost_fixed:.6f}")
-            debug(f"Dynamic Cost Calculation: ({delta_usage} - {delta_return}) * {self.current_dynamic_tariff} = {cost_dynamic:.6f}")
-
-            UpdateElectricCounterSensor(SIMULATED_P1_METER, "Simulated P1 Meter", current_simulated_p1_power, current_simulated_p1_energy)
-            UpdateBatterySocSensor(BATTERY_SOC, "Battery SoC", f"{(self.soc / self.config['capacity']) * 100:.6f}")
-            UpdateElectricCounterSensor(BATTERY_ENERGY, "Battery Energy", battery_power, self.soc)
-            UpdateCostSensor(COST_FIXED, "Cost Fixed Tariff", f"{self.cost_fixed_real * 100:.6f}")
-            UpdateCostSensor(COST_DYNAMIC, "Cost Dynamic Tariff", f"{self.cost_dynamic_real * 100:.6f}")
+            # bereken de nieuwe kosten
+            new_cost_fixed = current_cost_fixed + delta_cost_fixed
+            new_cost_dynamic = current_cost_dynamic + delta_cost_dynamic
+            new_cost_fixed_simulated = current_cost_fixed_simulated + delta_cost_fixed_simulated
+            new_cost_dynamic_simulated = current_cost_dynamic_simulated + delta_cost_dynamic_simulated
+            
+            # Update all sensors with new values
+            UpdateElectricCounterSensor(SIMULATED_P1_METER, "Simulated P1 Meter", new_simulated_p1_power, new_simulated_p1_energy)
+            UpdateBatterySocSensor(BATTERY_SOC, "Battery SoC", f"{(new_battery_energy / self.config['capacity']) * 100:.6f}")
+            UpdateElectricCounterSensor(BATTERY_ENERGY, "Battery Energy", new_battery_power, new_battery_energy)
+            UpdateCostSensor(COST_FIXED, "Cost Fixed Tariff", new_cost_fixed * 100)  # Convert to cents
+            UpdateCostSensor(COST_DYNAMIC, "Cost Dynamic Tariff", new_cost_dynamic * 100)
+            UpdateCostSensor(COST_FIXED_SIMULATED, "Cost Fixed Tariff Simulated", new_cost_fixed_simulated * 100)
+            UpdateCostSensor(COST_DYNAMIC_SIMULATED, "Cost Dynamic Tariff Simulated", new_cost_dynamic_simulated * 100)
+            UpdateCostSensor(BATTERY_SAVINGS_FIXED, "Battery Savings Fixed Tariff", (new_cost_fixed_simulated - new_cost_fixed) * 100)
+            UpdateCostSensor(BATTERY_SAVINGS_DYNAMIC, "Battery Savings Dynamic Tariff", (new_cost_dynamic_simulated - new_cost_dynamic) * 100)
 
     def onHeartbeat(self):
         pass
